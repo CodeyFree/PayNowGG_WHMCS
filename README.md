@@ -14,6 +14,8 @@ Install
    https://YOUR-WHMCS-DOMAIN/modules/gateways/callback/paynowgg.php
 6. Subscribe at minimum to ON_ORDER_COMPLETED. Optional events logged/handled: ON_REFUND, ON_CHARGEBACK, ON_SUBSCRIPTION_ACTIVATED, ON_SUBSCRIPTION_RENEWED.
 
+<img width="1485" height="637" alt="image" src="https://github.com/user-attachments/assets/41cc8694-1763-40db-9326-97795ab0318b" />
+
 Notes
 -----
 - The module creates a PayNow customer and checkout from the WHMCS invoice.
