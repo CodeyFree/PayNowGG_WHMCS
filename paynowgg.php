@@ -79,7 +79,8 @@ function paynowgg_config()
         'allowSubscriptions' => array(
             'FriendlyName' => 'Allow Subscriptions',
             'Type' => 'yesno',
-            'Description' => 'Experimental: request PayNow subscription checkout for WHMCS recurring hosting/addon invoice lines. One-time invoice checkout is used when disabled.',
+            'Default' => 'on',
+            'Description' => 'Enable PayNow subscription checkout for WHMCS recurring hosting/addon invoice lines. When enabled, subscriptions auto-charge on renewal. One-time invoice checkout is used when disabled.',
         ),
         'debugMode' => array(
             'FriendlyName' => 'Debug Logging',
