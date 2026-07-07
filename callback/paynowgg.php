@@ -217,7 +217,6 @@ function paynowgg_callback_handleSubscriptionRenewal(array $gatewayParams, array
         $renewalCurrency = 'USD';
 
         // Extract renewal amount from PayNow webhook
-        // The webhook body should contain the order details with the renewal charge
         if (isset($body['order']) && is_array($body['order'])) {
             $order = $body['order'];
             if (isset($order['total_amount'])) {
@@ -242,21 +241,128 @@ function paynowgg_callback_handleSubscriptionRenewal(array $gatewayParams, array
             return;
         }
 
-        // Get the user's store currency
-        $userDetails = localAPI('GetClientsDetails', array('userid' => $userId, 'stats' => false));
-        $storeCurrency = isset($userDetails['currency']) ? (string) $userDetails['currency'] : 'USD';
+        // Try to find an existing renewal invoice created by WHMCS's automatic renewal system
+        // WHMCS creates renewal invoices ~14 days before the renewal date
+        $renewalInvoiceId = paynowgg_findRenewalInvoice($userId, $renewalAmount, $relid, $type);
 
-        // Adjust amount if currency differs (log the difference for manual review if needed)
-        $adjustedAmount = $renewalAmount;
-        if ($storeCurrency && $renewalCurrency && strtoupper($renewalCurrency) !== strtoupper($storeCurrency)) {
-            logModuleCall('PayNow.gg', 'subscription renewal: currency conversion', array(
+        if ($renewalInvoiceId) {
+            // Mark existing renewal invoice as paid
+            $subscriptionId = (string) ($body['id'] ?? $body['subscription_id'] ?? '');
+            $transactionId = $subscriptionId !== '' ? $subscriptionId . '-renewal' : (string) ($body['order_id'] ?? $body['id'] ?? '');
+            
+            addInvoicePayment($renewalInvoiceId, $transactionId, $renewalAmount, 0.0, 'paynowgg');
+
+            logModuleCall('PayNow.gg', 'subscription renewal: marked existing invoice as paid', array(
+                'invoice_id' => $renewalInvoiceId,
+                'user_id' => $userId,
                 'type' => $type,
                 'relid' => $relid,
                 'renewal_amount' => $renewalAmount,
-                'renewal_currency' => $renewalCurrency,
-                'store_currency' => $storeCurrency,
-            ), array('status' => 'currency mismatch - using renewal amount as-is'));
-            // Note: WHMCS will handle currency conversion based on store settings
+                'subscription_id' => $subscriptionId,
+            ), array('status' => 'success'));
+        } else {
+            // No existing renewal invoice found - create one
+            // This handles cases where WHMCS renewal system didn't create an invoice
+            // (e.g., manual subscription setup or if renewal generation failed)
+            paynowgg_createRenewalInvoice($userId, $renewalAmount, $relid, $type, $body);
+        }
+    } catch (Exception $e) {
+        logModuleCall('PayNow.gg', 'subscription renewal: error', array(
+            'type' => $type,
+            'relid' => $relid,
+            'event_id' => $body['id'] ?? 'unknown',
+        ), array('error' => $e->getMessage()), array('error' => $e->getMessage()));
+    }
+}
+
+function paynowgg_findRenewalInvoice($userId, $renewalAmount, $relid, $type)
+{
+    try {
+        // Look for unpaid invoices created in the last 30 days
+        // But specifically match to the hosting/addon record being renewed
+        $thirtyDaysAgo = date('Y-m-d', strtotime('-30 days'));
+        
+        $invoices = \WHMCS\Database\Capsule::table('tblinvoices')
+            ->where('userid', '=', (int) $userId)
+            ->where('status', '=', 'Unpaid')
+            ->where('datecreated', '>=', $thirtyDaysAgo)
+            ->orderBy('id', 'desc')
+            ->get();
+
+        foreach ($invoices as $invoice) {
+            $total = (float) $invoice->total;
+            
+            // First check: amount must match (within 0.01)
+            if (abs($total - $renewalAmount) >= 0.01) {
+                continue;
+            }
+
+            // Second check: invoice must contain a line item for this specific hosting/addon
+            $invoiceId = (int) $invoice->id;
+            if (paynowgg_invoiceContainsResource($invoiceId, $relid, $type)) {
+                return $invoiceId;
+            }
+        }
+        
+        return null;
+    } catch (Exception $e) {
+        logModuleCall('PayNow.gg', 'subscription renewal: error finding renewal invoice', array(
+            'user_id' => $userId,
+            'renewal_amount' => $renewalAmount,
+            'relid' => $relid,
+            'type' => $type,
+        ), array('error' => $e->getMessage()));
+        return null;
+    }
+}
+
+function paynowgg_invoiceContainsResource($invoiceId, $relid, $type)
+{
+    try {
+        $invoiceId = (int) $invoiceId;
+        $relid = (int) $relid;
+        
+        // Get all line items for this invoice
+        $items = \WHMCS\Database\Capsule::table('tblinvoiceitems')
+            ->where('invoiceid', '=', $invoiceId)
+            ->get();
+
+        if (empty($items)) {
+            return false;
+        }
+
+        foreach ($items as $item) {
+            $itemType = (string) ($item->type ?? '');
+            $itemRelid = (int) ($item->relid ?? 0);
+            
+            // Match the type and relid to the resource
+            if ($type === 'hosting' && $itemType === 'Hosting' && $itemRelid === $relid) {
+                return true;
+            }
+            if ($type === 'addon' && $itemType === 'Addon' && $itemRelid === $relid) {
+                return true;
+            }
+        }
+        
+        return false;
+    } catch (Exception $e) {
+        logModuleCall('PayNow.gg', 'subscription renewal: error checking invoice items', array(
+            'invoice_id' => $invoiceId,
+            'relid' => $relid,
+            'type' => $type,
+        ), array('error' => $e->getMessage()));
+        return false;
+    }
+}
+
+function paynowgg_createRenewalInvoice($userId, $renewalAmount, $relid, $type, $body)
+{
+    try {
+        // Get resource details for description
+        if ($type === 'hosting') {
+            $resource = \WHMCS\Database\Capsule::table('tblhosting')->where('id', '=', (int) $relid)->first();
+        } else {
+            $resource = \WHMCS\Database\Capsule::table('tblhostingaddons')->where('id', '=', (int) $relid)->first();
         }
 
         // Create invoice for renewal
@@ -279,11 +385,10 @@ function paynowgg_callback_handleSubscriptionRenewal(array $gatewayParams, array
 
         // Add the renewal line item to the invoice
         $description = '';
-        if ($type === 'hosting' && isset($resource->domain)) {
+        if ($type === 'hosting' && $resource && isset($resource->domain)) {
             $description = 'Renewal: ' . (string) $resource->domain;
-        } elseif ($type === 'addon') {
-            // Try to get addon name from metadata or database
-            $addonName = isset($resource->addonid) ? $resource->addonid : 'Addon';
+        } elseif ($type === 'addon' && $resource) {
+            $addonName = 'Addon';
             try {
                 $addonData = \WHMCS\Database\Capsule::table('tbladdons')->where('id', '=', (int) $resource->addonid)->first();
                 if ($addonData) {
@@ -298,31 +403,31 @@ function paynowgg_callback_handleSubscriptionRenewal(array $gatewayParams, array
         $lineParams = array(
             'invoiceid' => $invoiceId,
             'description' => $description ?: 'Subscription Renewal',
-            'amount' => $adjustedAmount,
+            'amount' => $renewalAmount,
             'taxed' => 0,
         );
 
         localAPI('InvoiceAddItem', $lineParams);
 
-        // Mark invoice as sent to trigger payment processing
-        localAPI('UpdateInvoice', array(
-            'invoiceid' => $invoiceId,
-            'status' => 'Sent',
-        ));
+        // PayNow has already charged the customer at renewal time, so mark the invoice as paid
+        $subscriptionId = (string) ($body['id'] ?? $body['subscription_id'] ?? '');
+        $transactionId = $subscriptionId !== '' ? $subscriptionId . '-renewal' : (string) ($body['order_id'] ?? $body['id'] ?? '');
+        
+        addInvoicePayment($invoiceId, $transactionId, $renewalAmount, 0.0, 'paynowgg');
 
-        logModuleCall('PayNow.gg', 'subscription renewal: invoice created', array(
+        logModuleCall('PayNow.gg', 'subscription renewal: invoice created and marked paid', array(
             'invoice_id' => $invoiceId,
             'user_id' => $userId,
             'type' => $type,
             'relid' => $relid,
             'renewal_amount' => $renewalAmount,
-            'renewal_currency' => $renewalCurrency,
-        ), array('status' => 'success'));
+            'subscription_id' => $subscriptionId,
+        ), array('status' => 'created (no existing found)'));
     } catch (Exception $e) {
-        logModuleCall('PayNow.gg', 'subscription renewal: error', array(
-            'type' => $type,
+        logModuleCall('PayNow.gg', 'subscription renewal: error creating invoice', array(
+            'user_id' => $userId,
             'relid' => $relid,
-            'event_id' => $body['id'] ?? 'unknown',
+            'type' => $type,
         ), array('error' => $e->getMessage()), array('error' => $e->getMessage()));
     }
 }
